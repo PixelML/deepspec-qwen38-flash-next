@@ -27,10 +27,26 @@ port contract (see docs/dflash-training-log.md for the full record):
    both `AutoTokenizer.from_pretrained` and `AutoModel.from_pretrained`, read
    from `config.model.target_model_revision` (falls back to `None` /
    latest-main if unset, so this is a no-op for existing non-pinned configs).
+4. Single-process / single-worker model-parallel load (added 2026-09-06,
+   after prep_cache attempt ap-DfX3UpFK7rJsCilolEiMMf OOM'd at model load on
+   B200:4). The original script's `torch.multiprocessing.spawn(main,
+   nprocs=torch.cuda.device_count())` is data-parallel: one process per
+   visible GPU, each loading its OWN full copy of the target. That's fine
+   for smaller dense targets but OOMs immediately for Qwen3.8-Flash-Next
+   (352GB bf16 vs 180GB/card). Fixed by running exactly one process
+   (`init_dist_single()`, world_size=1) that loads the target ONCE via
+   `device_map="auto"` + `max_memory={i: "165GiB" for i in range(N)}`
+   (model-parallel across all visible GPUs). Because tapped layers can now
+   land on different physical GPUs, `capture_layer()`'s hook and
+   `target_last_hidden_states` both move their tensors to CPU immediately
+   (`.detach().cpu()`) rather than leaving them on whatever CUDA device the
+   hook fired on -- `torch.cat(...)` over the tapped tensors requires one
+   common device, and CPU is that common device.
 """
 
 import argparse
 from dataclasses import dataclass
+from datetime import timedelta
 import json
 import os
 
@@ -59,7 +75,6 @@ from deepspec.utils import (
     CustomJSONEncoder,
     get_git_diff,
     get_git_sha,
-    init_dist,
     is_global_main_process,
     load_config,
     main_process_first,
@@ -77,6 +92,43 @@ os.environ["TOKENIZERS_PARALLELISM"] = "false"
 torch.set_float32_matmul_precision("high")
 
 QWEN4_EXP_MODEL_TYPES = ("qwen4_exp",)
+
+
+def init_dist_single():
+    """Single-process, single-"rank" dist init (P2 OOM-fix, 2026-09-06).
+
+    The original prepare_target_cache.py spawns one process PER VISIBLE GPU
+    (torch.multiprocessing.spawn(main, nprocs=torch.cuda.device_count())) and
+    each process's deepspec.utils.init_dist() derives local_world_size from
+    torch.cuda.device_count() -- i.e. data-parallel cache prep, one full copy
+    of the target model per GPU. For Qwen/Qwen3.8-Flash-Next (352GB in bf16)
+    that OOMs at model load on B200:4 (first prep_cache attempt,
+    ap-DfX3UpFK7rJsCilolEiMMf). Fixed here by running exactly one process
+    (world_size=1, rank=0) that loads the target ONCE via
+    device_map="auto" (model-parallel across all visible GPUs), instead of
+    reusing deepspec.utils.init_dist(). A trivial single-member gloo
+    process group is still created (rather than deleting all dist.* calls
+    from main()) purely so the unmodified rank/world_size-generic helpers
+    below (main_process_first, is_global_main_process, dist.barrier,
+    dist.broadcast_object_list) keep working unchanged -- with world_size=1
+    every one of those is a no-op / trivially resolves to "rank 0 does
+    everything".
+    """
+    os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
+    os.environ.setdefault("MASTER_PORT", "29500")
+    dist.init_process_group(
+        backend="gloo",
+        init_method=f"tcp://{os.environ['MASTER_ADDR']}:{os.environ['MASTER_PORT']}",
+        rank=0,
+        world_size=1,
+        timeout=timedelta(minutes=60),
+    )
+    # Host-side batch tensors live on cuda:0 (where embed_tokens is placed by
+    # device_map="auto"); accelerate's dispatch hooks move activations to
+    # whichever GPU owns each layer as the forward pass crosses shard
+    # boundaries -- we never need to know / set the device of any layer.
+    torch.cuda.set_device(0)
+    return torch.device("cuda", 0), 0, 1
 
 
 @dataclass(frozen=True)
@@ -140,7 +192,14 @@ def run_target_forward_with_hooks(
 
     def capture_layer(layer_id: int):
         def hook(_module, _inputs, output):
-            captured_hidden_states[layer_id] = _get_hook_tensor(output).detach()
+            # .cpu() here (not just .detach()): with device_map="auto" the
+            # target is sharded model-parallel across multiple physical
+            # GPUs, so different tapped layers' hooks can fire on different
+            # CUDA devices. The torch.cat(...) below requires every tapped
+            # tensor on one common device, and CPU is that common device
+            # (also matches the eventual write path, which needs CPU bytes
+            # anyway -- see _tensor_to_bfloat16_bytes).
+            captured_hidden_states[layer_id] = _get_hook_tensor(output).detach().cpu()
 
         return hook
 
@@ -177,7 +236,10 @@ def run_target_forward_with_hooks(
                 output_hidden_states=False,
                 use_cache=False,
             )
-            target_last_hidden_states = target_output.last_hidden_state.detach()
+            # Same cross-device rationale as capture_layer(): the final
+            # decoder layer (and thus last_hidden_state) may sit on a
+            # different physical GPU than tap layer 0 under device_map="auto".
+            target_last_hidden_states = target_output.last_hidden_state.detach().cpu()
 
             tap_sanity_stats = None
             if tap_sanity_check:
@@ -327,7 +389,8 @@ def main(local_rank: int):
     target_model_revision = config.model.get("target_model_revision")
     min_loss_tokens = int(cli_args.min_loss_tokens)
     seed_all(int(config.seed))
-    device, global_rank, world_size = init_dist(local_rank)
+    del local_rank  # unused: single-process mode always runs as rank 0.
+    device, global_rank, world_size = init_dist_single()
     output_dir = os.path.abspath(cli_args.output_dir)
     print_on_local_main(json.dumps(config, indent=4, cls=CustomJSONEncoder), flush=True)
     print_on_local_main(
@@ -368,12 +431,22 @@ def main(local_rank: int):
         config.model.target_model_name_or_path,
         revision=target_model_revision,
     )
+    # Single-process, model-parallel load (P2 OOM-fix, 2026-09-06): the
+    # original .to(device=device) call assumed a full model copy per
+    # (data-parallel) worker process, which OOMs for a 352GB bf16 target on
+    # a single B200 (180GB). device_map="auto" shards the model itself
+    # across all 4 visible GPUs instead -- no .to() call after this (the
+    # model is already dispatched; calling .to() on a dispatched model is
+    # unsupported / would break the placement).
+    num_visible_gpus = torch.cuda.device_count()
     target_model = AutoModel.from_pretrained(
         config.model.target_model_name_or_path,
         revision=target_model_revision,
         dtype=torch.bfloat16,
         attn_implementation="sdpa",
-    ).to(device=device).eval()
+        device_map="auto",
+        max_memory={i: "165GiB" for i in range(num_visible_gpus)},
+    ).eval()
     target_hidden_size = _get_target_hidden_size(target_model)
     train_collator = ConversationCollator(
         tokenizer=tokenizer,
@@ -523,4 +596,11 @@ if __name__ == "__main__":
     if os.path.exists(".git"):
         print("git status:", "\n\n".join(get_git_sha(detail_info=True)))
         print("git diff:", get_git_diff())
-    torch.multiprocessing.spawn(main, nprocs=torch.cuda.device_count())
+    # Single-process, single-worker (P2 OOM-fix, 2026-09-06): NOT
+    # torch.multiprocessing.spawn(main, nprocs=torch.cuda.device_count())
+    # anymore -- that data-parallel pattern loaded one full 352GB bf16
+    # target copy per visible GPU and OOM'd at model load on B200:4
+    # (ap-DfX3UpFK7rJsCilolEiMMf). One process now loads the target once via
+    # device_map="auto" (model-parallel across all visible GPUs); see
+    # init_dist_single() / the AutoModel.from_pretrained call above.
+    main(local_rank=0)
