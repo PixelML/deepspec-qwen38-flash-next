@@ -250,12 +250,20 @@ class BaseTrainer:
 
     def build_models(self):
         model_args = self.args.model
+        # Optional pinned revision (e.g. a specific commit SHA) for the
+        # target checkpoint. Not part of the original config surface; only
+        # set for targets (like Qwen3.8-Flash-Next) whose upstream repo is
+        # still moving and needs a reproducible pin. Absent -> default
+        # behavior (latest main) is unchanged for all existing configs.
+        target_model_revision = getattr(model_args, "target_model_revision", None)
 
         tokenizer = AutoTokenizer.from_pretrained(
             model_args.target_model_name_or_path,
+            revision=target_model_revision,
         )
         target_config = AutoConfig.from_pretrained(
             model_args.target_model_name_or_path,
+            revision=target_model_revision,
         )
 
         draft_model = self._build_draft_model(
@@ -268,6 +276,7 @@ class BaseTrainer:
         # embeddings and lm_head weights.
         target_model = AutoModelForCausalLM.from_pretrained(
             model_args.target_model_name_or_path,
+            revision=target_model_revision,
             dtype=self.precision_dtype,
         ).to(device="cpu").eval()
         target_embed_tokens = target_model.get_input_embeddings()

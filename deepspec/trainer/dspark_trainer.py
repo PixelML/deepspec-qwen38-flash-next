@@ -8,6 +8,9 @@ from deepspec.modeling.dspark.qwen3 import Qwen3DSparkModel
 from deepspec.modeling.dspark.qwen3.config import (
     build_draft_config as build_qwen3_draft_config,
 )
+from deepspec.modeling.dspark.qwen4_exp.config import (
+    build_draft_config as build_qwen4_exp_draft_config,
+)
 from deepspec.trainer.base_trainer import BaseTrainer
 
 
@@ -46,3 +49,16 @@ class Gemma4DSparkTrainer(Qwen3DSparkTrainer):
             model_args=model_args,
         )
         return Gemma4DSparkModel(draft_config)
+
+
+class Qwen4ExpDSparkTrainer(Qwen3DSparkTrainer):
+    # Qwen4Exp (Qwen3.8-Flash-Next) target: the draft model itself is a plain
+    # Qwen3DSparkModel (reused unchanged), only the config-construction
+    # (target_config.text_config extraction + intermediate_size synthesis)
+    # differs -- see deepspec/modeling/dspark/qwen4_exp/config.py.
+    def _build_draft_model(self, *, target_config, model_args):
+        draft_config = build_qwen4_exp_draft_config(
+            target_config=target_config,
+            model_args=model_args,
+        )
+        return Qwen3DSparkModel(draft_config)

@@ -13,6 +13,7 @@ class ChatTemplate:
     system_prompt: str | None
     end_of_turn_token: str | None
     assistant_loss_prefix: str | None = None
+    enable_thinking: bool | None = None
 
 
 class TemplateRegistry:
@@ -50,12 +51,34 @@ TEMPLATE_REGISTRY.register(
     ),
 )
 
+# Qwen3.8-Flash-Next (qwen4_exp) DFlash draft training. NVFP4-teacher regen
+# corpus was generated with thinking disabled and no system message (see
+# modal_calibrate.py chat_template_kwargs={"enable_thinking": False} and
+# modal_regen.py --disable-thinking). We deliberately omit
+# assistant_loss_prefix here: the qwen chat template auto-inserts an empty
+# "<think>\n\n</think>\n\n" block into every assistant turn regardless of
+# enable_thinking, and we do not want to double-inject/mask around it -- the
+# loss mask below is computed purely from assistant_header/end_of_turn_token
+# boundaries, so the empty think block is naturally included in the scored
+# span (matching what the target model actually produced during regen).
+TEMPLATE_REGISTRY.register(
+    "qwen38_flash_next",
+    ChatTemplate(
+        assistant_header="<|im_start|>assistant\n",
+        user_header="<|im_start|>user\n",
+        system_prompt=None,
+        end_of_turn_token="<|im_end|>\n",
+        enable_thinking=False,
+    ),
+)
+
 
 class GeneralParser:
     def __init__(self, tokenizer, chat_template):
         self.tokenizer = tokenizer
         self.chat_template = chat_template
         self.system_prompt = chat_template.system_prompt
+        self.enable_thinking = chat_template.enable_thinking
         self.assistant_loss_prefix = chat_template.assistant_loss_prefix or ""
         self.assistant_message_separator = chat_template.assistant_header or ""
         self.assistant_pattern = (
@@ -98,6 +121,7 @@ class GeneralParser:
             self.tokenizer,
             render_messages,
             add_generation_prompt=False,
+            enable_thinking=self.enable_thinking,
         )
 
         encoding = self.tokenizer(
