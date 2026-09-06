@@ -83,6 +83,7 @@ QWEN4_EXP_MODEL_TYPES = ("qwen4_exp",)
 class TargetForwardResult:
     target_hidden_states: torch.Tensor
     target_last_hidden_states: torch.Tensor
+    tap_sanity_stats: dict | None = None
 
 
 def _get_target_backbone(target_model):
@@ -127,6 +128,7 @@ def run_target_forward_with_hooks(
     input_ids: torch.Tensor,
     attention_mask: torch.Tensor,
     target_layer_ids,
+    tap_sanity_check: bool = False,
 ):
     backbone = _get_target_backbone(target_model)
     layer_modules = backbone.layers
@@ -176,6 +178,55 @@ def run_target_forward_with_hooks(
                 use_cache=False,
             )
             target_last_hidden_states = target_output.last_hidden_state.detach()
+
+            tap_sanity_stats = None
+            if tap_sanity_check:
+                # First-batch sanity check (coordinator-required 2026-09-06):
+                # confirm the 5 tapped tensors are individually shaped
+                # [B, T, hidden], finite, and have mutually differing
+                # per-layer stds (guards against a hook-wiring bug that
+                # would silently capture the same tensor 5x).
+                per_layer = {}
+                stds = []
+                for layer_id in target_layer_ids:
+                    tensor = captured_hidden_states[layer_id]
+                    assert tensor.dim() == 3 and tensor.shape[0] == input_ids.shape[0], (
+                        f"tap layer {layer_id}: expected [B,T,H], got {tuple(tensor.shape)}"
+                    )
+                    assert torch.isfinite(tensor).all(), (
+                        f"tap layer {layer_id}: non-finite values in tapped tensor"
+                    )
+                    std = float(tensor.float().std().item())
+                    per_layer[int(layer_id)] = {
+                        "shape": list(tensor.shape),
+                        "std": std,
+                        "mean": float(tensor.float().mean().item()),
+                    }
+                    stds.append(std)
+                # Pairwise std divergence: no two tapped layers should have
+                # near-identical std (would indicate reading the same
+                # tensor 5x).
+                min_pairwise_std_diff = min(
+                    abs(a - b)
+                    for i, a in enumerate(stds)
+                    for b in stds[i + 1 :]
+                )
+                assert min_pairwise_std_diff > 1e-4, (
+                    "tap sanity check FAILED: per-layer stds are near-identical "
+                    f"(min pairwise diff={min_pairwise_std_diff:.6f}) -- possible "
+                    f"hook-wiring bug reading the same tensor multiple times. "
+                    f"per_layer stats={per_layer}"
+                )
+                tap_sanity_stats = {
+                    "per_layer": per_layer,
+                    "min_pairwise_std_diff": min_pairwise_std_diff,
+                }
+                print(
+                    "[tap sanity check PASSED] "
+                    + json.dumps(tap_sanity_stats, indent=2),
+                    flush=True,
+                )
+
             target_hidden_states = torch.cat(
                 [captured_hidden_states[layer_id] for layer_id in target_layer_ids],
                 dim=-1,
@@ -188,6 +239,7 @@ def run_target_forward_with_hooks(
     return TargetForwardResult(
         target_hidden_states=target_hidden_states,
         target_last_hidden_states=target_last_hidden_states,
+        tap_sanity_stats=tap_sanity_stats,
     )
 
 
@@ -374,7 +426,13 @@ def main(local_rank: int):
                     input_ids=batch["input_ids"],
                     attention_mask=batch["attention_mask"],
                     target_layer_ids=target_layer_ids,
+                    tap_sanity_check=(batch_idx == 0),
                 )
+                if batch_idx == 0 and target_result.tap_sanity_stats is not None:
+                    atomic_json_dump(
+                        target_result.tap_sanity_stats,
+                        os.path.join(rank_dir, "tap_sanity_check.json"),
+                    )
                 seq_lens = batch["attention_mask"].sum(dim=1).tolist()
                 for sample_idx_in_batch, seq_len in enumerate(seq_lens):
                     seq_len = int(seq_len)
