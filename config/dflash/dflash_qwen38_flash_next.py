@@ -18,13 +18,15 @@ model = dict(
     # Qwen3.8-Flash-Next (qwen4_exp): 48 decoder layers, full-attention/QSA
     # at every 4th layer starting from index 3 (0-indexed):
     #   [3, 7, 11, 15, 19, 23, 27, 31, 35, 39, 43, 47]  (12 layers total)
-    # We tap 5 of these 12, mirroring the original Qwen3-8B protocol's
-    # spacing (5 taps spread "between layer 2 and n-3" with an ~8-layer
-    # step): skip the first ordinal (3) and the last 3 ordinals (39, 43, 47),
-    # taking every other remaining full-attention layer:
-    #   [7, 15, 23, 27, 35]
-    # See docs/dflash-training-log.md for the full derivation.
-    target_layer_ids=[7, 15, 23, 27, 35],
+    # DeepSpec's rule: uniform spacing from the second layer through the
+    # third-to-last (the Qwen3-8B/36-layer protocol's [1,9,17,25,33] is
+    # exactly this rule applied to its own full-attention layout). Applied
+    # here per coordinator correction 2026-09-06:
+    #   [3, 15, 23, 35, 43]
+    # (An earlier pick, [7,15,23,27,35], was rejected: 27 and 35 are
+    # adjacent full-attention ordinals -- not uniform -- and nothing was
+    # tapped after 35. See docs/dflash-training-log.md for the full note.)
+    target_layer_ids=[3, 15, 23, 35, 43],
     # First embedding row after all defined vocab.json (0..248043) +
     # added special tokens (248044..248076) for Qwen/Qwen3.8-Flash-Next,
     # i.e. the first row in the padded embedding table's reserved slack --
