@@ -277,7 +277,7 @@ class Exporter:
                 )
                 self.source_row_ids.append(int(row_idx))
             if self.on_sample is not None:
-                self.on_sample(row_idx, token_ids, hidden, last)
+                self.on_sample(row_idx, token_ids, hidden, last, loss_mask[:seq_len])
             self.num_written += 1
             self.num_tokens += seq_len
         _CAPTURED.clear()
@@ -498,10 +498,11 @@ def main():
 
     gate_store = {} if cli.gate_dump else None
 
-    def _on_sample(row_idx, token_ids, hidden, last):
+    def _on_sample(row_idx, token_ids, hidden, last, loss_mask):
         if gate_store is not None:
             gate_store[int(row_idx)] = {
                 "input_ids": token_ids,
+                "loss_mask": loss_mask.clone(),
                 "target_hidden_states": hidden,
                 "target_last_hidden_states": last,
             }
@@ -587,11 +588,16 @@ def main():
         for row_idx, blob in gate_store.items():
             key = tuple(blob["input_ids"].tolist())
             out = by_ids.get(key)
-            if out is None or not out.prompt_logprobs:
-                continue
             last = blob["target_last_hidden_states"].to(lm_weight.device, lm_weight.dtype)
             logits = torch.nn.functional.linear(last, lm_weight)
             mine = logits.argmax(dim=-1).tolist()
+            # Full per-position reference top-1 (argmax(lm_head(last_hidden)))
+            # for every token of this row -- independent of whether vLLM's own
+            # prompt_logprobs happened to be available for the match check
+            # below. This is the fixture's ground-truth comparison target.
+            blob["lm_head_argmax_top1"] = torch.tensor(mine, dtype=torch.long)
+            if out is None or not out.prompt_logprobs:
+                continue
             ref = []
             keep = []
             for pos, entry in enumerate(out.prompt_logprobs):
