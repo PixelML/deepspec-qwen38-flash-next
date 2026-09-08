@@ -1,4 +1,5 @@
 from contextlib import nullcontext
+import json
 import math
 import os
 
@@ -135,6 +136,129 @@ def _compute_training_schedule(
     )
 
 
+def _lazy_load_print(message: str) -> None:
+    """print_on_global_main() needs an initialised process group; this helper
+    is also called from standalone scripts (e.g. the cache-alignment check),
+    so fall back to a plain print outside a dist context."""
+    try:
+        print_on_global_main(message)
+    except (ValueError, RuntimeError, AssertionError):
+        print(message, flush=True)
+
+
+def _resolve_target_file(model_name_or_path: str, filename: str, revision=None):
+    """Local snapshot dir, else the HF cache (never a fresh full download)."""
+    if os.path.isdir(model_name_or_path):
+        candidate = os.path.join(model_name_or_path, filename)
+        return candidate if os.path.exists(candidate) else None
+    from huggingface_hub import hf_hub_download
+    try:
+        return hf_hub_download(model_name_or_path, filename, revision=revision)
+    except Exception:
+        return None
+
+
+class _WeightShim:
+    """Minimal stand-in for nn.Embedding / nn.Linear.
+
+    `initialize_embeddings_and_head` only reads `.weight` (shape assert plus a
+    `copy_`), so a bare tensor holder is a faithful substitute for the real
+    module and costs one tensor instead of a whole model.
+    """
+
+    def __init__(self, weight):
+        self.weight = weight
+
+
+def load_target_embeddings_lazily(
+    *,
+    model_name_or_path: str,
+    revision,
+    dtype,
+):
+    """Read ONLY `embed_tokens.weight` and `lm_head.weight` from the target.
+
+    `build_models` needs exactly two tensors from the target checkpoint to
+    initialise the draft model's frozen embedding and head. The obvious
+    `AutoModelForCausalLM.from_pretrained(...).to("cpu")` materialises the
+    ENTIRE target to get them -- for Qwen3.8-Flash-Next that is ~352 GB of
+    bf16 read into host RAM on every single training launch (minutes of wall
+    clock, and it forces a large-RAM container), all to copy ~2.5 GB.
+
+    This reads the safetensors index, opens only the shard(s) that actually
+    hold those two tensors, and returns `.weight`-carrying shims. Returns
+    None if anything about the layout is unexpected, so the caller can fall
+    back to the original full-model path rather than guess.
+
+    Handles the composite/VLM key prefix (`model.language_model.embed_tokens`
+    for qwen4_exp) and tied embeddings (no `lm_head.weight` in the map).
+    """
+    from safetensors import safe_open
+
+    index_path = _resolve_target_file(
+        model_name_or_path, "model.safetensors.index.json", revision
+    )
+    if index_path is None:
+        _lazy_load_print(
+            "lazy target-embedding load: no safetensors index; using full load"
+        )
+        return None
+    with open(index_path, "r", encoding="utf-8") as handle:
+        weight_map = json.load(handle)["weight_map"]
+
+    def _find(suffix):
+        hits = [key for key in weight_map if key.endswith(suffix)]
+        if not hits:
+            return None
+        # Shortest key wins: prefer `lm_head.weight` over any
+        # `...mtp.lm_head.weight` / per-layer lookalike.
+        return min(hits, key=len)
+
+    embed_key = _find("embed_tokens.weight")
+    if embed_key is None:
+        _lazy_load_print(
+            "lazy target-embedding load: no embed_tokens.weight; using full load"
+        )
+        return None
+    head_key = _find("lm_head.weight")
+
+    shard_cache = {}
+
+    def _read(key):
+        shard = weight_map[key]
+        if shard not in shard_cache:
+            path = _resolve_target_file(model_name_or_path, shard, revision)
+            if path is None:
+                raise FileNotFoundError(f"target shard {shard} not resolvable")
+            shard_cache[shard] = path
+        with safe_open(shard_cache[shard], framework="pt", device="cpu") as handle:
+            return handle.get_tensor(key)
+
+    try:
+        embed_weight = _read(embed_key).to(dtype)
+        if head_key is None:
+            # Tied embeddings: the head IS the embedding matrix.
+            head_weight = embed_weight
+            head_source = f"{embed_key} (tied)"
+        else:
+            head_weight = _read(head_key).to(dtype)
+            head_source = head_key
+    except Exception as exc:
+        _lazy_load_print(
+            f"lazy target-embedding load failed ({type(exc).__name__}: {exc}); "
+            "using full load"
+        )
+        return None
+
+    _lazy_load_print(
+        f"lazy target-embedding load: {embed_key} {tuple(embed_weight.shape)} + "
+        f"{head_source} {tuple(head_weight.shape)} "
+        f"({(embed_weight.numel() + head_weight.numel()) * embed_weight.element_size() / 1e9:.2f} GB, "
+        "full target never materialised)"
+    )
+    return _WeightShim(embed_weight), _WeightShim(head_weight)
+
+
 def _launch_eval(
     *,
     target_model_name_or_path: str,
@@ -146,8 +270,8 @@ def _launch_eval(
     from deepspec.utils.constant import auto_eval_command
     if auto_eval_command is not None:
         command = auto_eval_command(target_model_name_or_path,checkpoint_dir,step,tensorboard_dir,exp_name)
-        print_on_global_main(f"Submitting auto eval for {checkpoint_dir}")
-        print_on_global_main(command)
+        _lazy_load_print(f"Submitting auto eval for {checkpoint_dir}")
+        _lazy_load_print(command)
         os.system(command)
     else:
         print("You can use this function to launch your auto eval script!")
@@ -273,14 +397,25 @@ class BaseTrainer:
         draft_model = draft_model.to(device=self.device, dtype=self.precision_dtype)
 
         # Training only uses the target checkpoint to initialize frozen draft
-        # embeddings and lm_head weights.
-        target_model = AutoModelForCausalLM.from_pretrained(
-            model_args.target_model_name_or_path,
+        # embeddings and lm_head weights -- two tensors. Read just those two
+        # straight out of the safetensors shards; only fall back to
+        # materialising the whole target if the layout is unexpected.
+        lazy = load_target_embeddings_lazily(
+            model_name_or_path=model_args.target_model_name_or_path,
             revision=target_model_revision,
             dtype=self.precision_dtype,
-        ).to(device="cpu").eval()
-        target_embed_tokens = target_model.get_input_embeddings()
-        target_lm_head = target_model.get_output_embeddings()
+        )
+        if lazy is not None:
+            target_embed_tokens, target_lm_head = lazy
+            target_model = None
+        else:
+            target_model = AutoModelForCausalLM.from_pretrained(
+                model_args.target_model_name_or_path,
+                revision=target_model_revision,
+                dtype=self.precision_dtype,
+            ).to(device="cpu").eval()
+            target_embed_tokens = target_model.get_input_embeddings()
+            target_lm_head = target_model.get_output_embeddings()
         assert (target_lm_head is not None) and (target_embed_tokens is not None)
         draft_model.initialize_embeddings_and_head(
             embed_tokens=target_embed_tokens,

@@ -63,13 +63,31 @@ def _validate_required_text_fields(text_config) -> None:
 DRAFT_INTERMEDIATE_SIZE_RATIO = 3
 
 
-def build_draft_config(target_config, model_args):
-    draft_config = get_qwen4_exp_text_config(target_config)
-    _validate_required_text_fields(draft_config)
+def _draft_rope_parameters(text_config):
+    """A clean `default` rope spec for the DRAFT model.
 
-    num_target_layers = int(draft_config.num_hidden_layers)
+    The target's `rope_parameters` carries mRoPE fields (`mrope_section`,
+    `mrope_interleaved`) that belong to the multimodal target and mean nothing
+    to a plain Qwen3 draft -- transformers logs "Unrecognized keys in
+    rope_parameters" for exactly this. Keep only the base frequency.
+    """
+    params = getattr(text_config, "rope_parameters", None)
+    theta = None
+    if isinstance(params, dict):
+        theta = params.get("rope_theta") or params.get("theta")
+    elif params is not None:
+        theta = getattr(params, "rope_theta", None) or getattr(params, "theta", None)
+    if theta is None:
+        theta = getattr(text_config, "rope_theta", 10000.0)
+    return {"rope_type": "default", "rope_theta": float(theta)}
+
+
+def build_draft_config(target_config, model_args):
+    text_config = get_qwen4_exp_text_config(target_config)
+    _validate_required_text_fields(text_config)
+
+    num_target_layers = int(text_config.num_hidden_layers)
     num_draft_layers = int(model_args.num_draft_layers)
-    layer_types = ["full_attention"] * num_draft_layers
 
     assert "target_layer_ids" in model_args, "target_layer_ids must be provided."
     target_layer_ids = validate_target_layer_ids(
@@ -93,24 +111,60 @@ def build_draft_config(target_config, model_args):
             "markov_head_type must be provided when markov_rank > 0."
         )
 
-    # The draft model is a plain Qwen3-style transformer (Qwen3DSparkModel),
-    # NOT a Qwen4Exp/HC model, so architectures/layer_types/attn_implementation
-    # below describe the DRAFT model, not the target. num_target_layers /
-    # target_layer_ids record how the draft ties back into the target's
-    # (HC-contracted) hidden states -- see prepare_target_cache_qwen38_flash_next.py
-    # for how those tapped tensors are produced.
+    # Build a REAL Qwen3Config rather than mutating a deepcopy of the target's
+    # Qwen4ExpTextConfig (which is what qwen3/config.py and gemma4/config.py
+    # do for their own targets).
+    #
+    # Why the deepcopy approach cannot work here: the draft model IS a
+    # Qwen3DSparkModel -- a plain, dense, non-HC Qwen3 transformer -- but a
+    # deepcopied Qwen4ExpTextConfig keeps Qwen4Exp's strict-dataclass
+    # validator. That validator normalises `full_attention` ->
+    # `qwen_sparse_attention` in __post_init__ and then REJECTS the raw
+    # `full_attention` values the draft needs, so `save_pretrained` blows up at
+    # the first checkpoint with
+    #   StrictDataclassClassValidationError: validate_architecture:
+    #   Unsupported Qwen4-Exp layer types: ['full_attention']
+    # (observed 2026-09-07, app ap-azj8NvX28jsKgtkwFFl461: the 1-epoch
+    # diagnostic trained cleanly to 77/77 and then lost the checkpoint at save
+    # time). Reloading such a config would fail the same way, so this also
+    # unblocks `Qwen3DSparkModel.from_pretrained` for eval and for publishing.
+    #
+    # Only the draft-relevant fields carry over; everything MoE/HC/PLE/QSA/
+    # vision-specific in the target config is deliberately dropped.
+    from transformers import Qwen3Config
+
+    draft_config = Qwen3Config(
+        vocab_size=int(text_config.vocab_size),
+        hidden_size=int(text_config.hidden_size),
+        intermediate_size=int(text_config.hidden_size) * DRAFT_INTERMEDIATE_SIZE_RATIO,
+        num_hidden_layers=num_draft_layers,
+        num_attention_heads=int(text_config.num_attention_heads),
+        num_key_value_heads=int(text_config.num_key_value_heads),
+        head_dim=int(text_config.head_dim),
+        hidden_act=str(text_config.hidden_act),
+        max_position_embeddings=int(text_config.max_position_embeddings),
+        initializer_range=float(text_config.initializer_range),
+        rms_norm_eps=float(text_config.rms_norm_eps),
+        use_cache=True,
+        tie_word_embeddings=False,
+        rope_parameters=_draft_rope_parameters(text_config),
+        attention_bias=bool(text_config.attention_bias),
+        attention_dropout=float(text_config.attention_dropout),
+        use_sliding_window=False,
+        layer_types=["full_attention"] * num_draft_layers,
+    )
+
     draft_config.architectures = ["Qwen3DSparkModel"]
+    # Provenance: which target these features came from, and how the draft ties
+    # back into its (HC-contracted) hidden states.
     draft_config.target_model_type = str(target_config.model_type)
-    draft_config.target_text_model_type = str(draft_config.model_type)
+    draft_config.target_text_model_type = str(text_config.model_type)
     draft_config.num_target_layers = num_target_layers
-    draft_config.num_hidden_layers = num_draft_layers
-    draft_config.intermediate_size = int(draft_config.hidden_size) * DRAFT_INTERMEDIATE_SIZE_RATIO
+    draft_config.target_layer_ids = target_layer_ids
+
     draft_config.block_size = int(model_args.block_size)
-    draft_config.tie_word_embeddings = False
-    draft_config.layer_types = layer_types
     draft_config._attn_implementation = TRAIN_ATTN_IMPLEMENTATION
     draft_config.mask_token_id = int(model_args.mask_token_id)
-    draft_config.target_layer_ids = target_layer_ids
     draft_config.num_anchors = int(model_args.num_anchors)
     draft_config.enable_confidence_head = enable_confidence_head
     if enable_confidence_head:

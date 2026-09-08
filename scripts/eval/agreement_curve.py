@@ -36,10 +36,16 @@ def main():
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
+    # Must match training: Qwen3DSparkModel._forward_backbone builds a
+    # flex_attention BlockMask for its block-causal draft mask, so loading with
+    # "sdpa" fails inside attention with
+    #   TypeError: scaled_dot_product_attention(): argument 'attn_mask' must be
+    #   Tensor, not BlockMask
+    # (the draft config itself pins _attn_implementation="flex_attention").
     model = Qwen3DSparkModel.from_pretrained(
         args.checkpoint_dir,
         dtype=torch.bfloat16,
-        attn_implementation="sdpa",
+        attn_implementation="flex_attention",
     ).to(device=device, dtype=torch.bfloat16).eval()
 
     dataset = CacheDataset(cache_dir=args.cache_dir)
@@ -64,6 +70,14 @@ def main():
                 for k, v in batch.items()
                 if k != "attention_mask"
             }
+            # The cache stores input_ids as int32 (see TARGET_CACHE_TOKEN_DTYPE)
+            # and training reaches the model through CUDAPrefetcher, which casts
+            # to int64 on GPU. This script builds its own loader, so it must do
+            # the same cast -- otherwise create_noise_embed's index_put_ raises
+            # "Index put requires the source and destination dtypes match,
+            # got Long for the destination and Int for the source".
+            if batch["input_ids"].dtype != torch.long:
+                batch["input_ids"] = batch["input_ids"].to(torch.long)
             outputs = model(
                 input_ids=batch["input_ids"],
                 target_hidden_states=batch["target_hidden_states"],
