@@ -2,7 +2,7 @@
 
 We spent about $450 of cloud GPU and four days training a DFlash drafter for
 Qwen3.8-Flash-Next, then served it on a pair of DGX Sparks. It beat the model's own
-speculative decoding head by 4.6% in eager mode.
+speculative decoding head by 3.9% in eager mode, once we bothered to tune that head.
 
 That's not much of a headline. The interesting part is the four measurement mistakes we made
 along the way. Two we caught ourselves, and the two that mattered most we only caught because
@@ -26,19 +26,37 @@ layers, train a five layer drafter to predict a block of seven tokens in one par
 The idea is that one wide pass beats the built in head's three sequential ones.
 
 Final numbers, same 100 prompt fixture for every arm, greedy, batch size one, eager mode,
-256 token outputs, one boot per arm:
+256 token outputs, two boots per arm and two runs of 100 prompts per boot:
 
 | | tokens/sec |
 |---|---|
-| no speculation | 24.3 |
-| built in MTP, 3 tokens | 49.9 |
-| our drafter, block 5 | 52.2 |
+| no speculation | 24.85 |
+| built in MTP, 1 token | 41.32 |
+| built in MTP, 3 tokens | 50.07 |
+| built in MTP, 4 tokens (best baseline) | 50.37 |
+| built in MTP, 6 tokens | 46.99 |
+| our drafter, block 4 | 52.02 |
+| our drafter, block 5 | 52.32 |
+| our drafter, block 7 | 50.54 |
 
-Plus 4.6% overall, with a 95% confidence interval of 2.1 to 7.1 percent from a paired
-stratified bootstrap over prompts. Split by workload it is more interesting: math 36% faster,
-code 12% faster, chat 13.5% slower.
+Plus 3.87% overall against the best built in setting, with a 95% confidence interval of 2.10
+to 5.77 percent from a paired stratified bootstrap over prompts. Block 4 is plus 3.26%
+[1.84, 4.79]. Against the k=3 baseline we used to quote, block 5 is plus 4.50% [2.35, 6.80].
+k=3 and k=4 are statistically a tie at about 50.2, so the honest description of the baseline
+is "about 50.2", and we quote against k=4 because it is the harder number.
+
+Split by workload against k=4 it is more interesting: math 28% faster, code a wash at plus
+0.4% with a confidence interval spanning zero, chat 5.9% slower.
 
 So: a maths drafter that costs you chat. Not nothing. Not a product either.
+
+Those confidence intervals are paired over prompts and contain no boot to boot variance
+component, because two boots cannot estimate one. Between its two boots, spec off moved 3.4%,
+built in MTP k=4 moved 2.0%, our block 4 arm moved 1.0%. That is the same size as the effect
+we are reporting, and it is the weakest part of this result. Two of the arms are also thinner
+than the rest: built in MTP k=1 is a single boot, and our block 4 arm has three runs rather
+than four. Blocks 2 and 3 required a one line widening of our own K allowlist in the serving
+plugin, so those arms are labelled patched.
 
 Worth noting because it surprised us. We trained at block 7, and block 7 does give the
 highest accepted length, but block 5 is faster on the wall clock. Each block size is a
@@ -48,10 +66,16 @@ draft queries attend to each other bidirectionally.
 ## Mistake one: we compared across harnesses
 
 Our first baseline was 41.9 tokens per second, measured with eight short synthetic prompts on
-a different harness. Our drafter hit 52.2 on the real evaluation set. That's a 25% win, and
+a different harness. Our drafter hit 52.3 on the real evaluation set. That's a 25% win, and
 we nearly wrote it down.
 
-Then someone re-ran the baseline on the same fixture as the drafter. It was 49.9, not 41.9.
+Then someone re-ran the baseline on the same fixture as the drafter. It was 50.1, not 41.9.
+
+Then we made the same class of error a second time, more quietly. We had been comparing
+against the built in head at k=3, because that is the setting the model card suggests, and we
+never swept it. When we did, k=4 was faster. Not by much, and the difference between k=3 and
+k=4 has a confidence interval spanning zero, but it moved our headline from 4.6% to 3.9%. A
+baseline you inherited is not a tuned baseline. Sweep the thing you are trying to beat.
 
 We never decomposed how much of that was prompt length and how much was the rest of the
 harness, so we can't tell you which it was. What we can tell you is the size of the error.
@@ -85,10 +109,22 @@ We made the same mistake twice, actually. Our losslessness check compared free r
 generations token by token and demanded 99% agreement. A single numerical coin flip early in
 a sequence sends the two generations somewhere completely different, so that check was
 measuring divergence, not correctness. Our own same configuration control agreed with itself
-20% of the time. The right test constrains both runs to the same prefix and asks whether the
-emitted tokens match what the target would have chosen.
+20% of the time.
 
-Even the fixed version isn't sufficient, and the model card says so at length.
+We later measured that floor properly, with a common prefix estimator that asks how often two
+runs first disagree given they have agreed so far. The per step argmax flip hazard is 0.97%
+to 2.61% depending on the arm. At roughly 2% per step, almost every 256 token greedy
+generation differs somewhere between two runs of the same server: eight of our eleven arms
+diverge on 98% or more of requests, and the best behaved three still diverge on about 81%.
+Batch size one, temperature zero, same server, same prompts.
+
+So no gate written on free running output identity can pass on this stack, at any threshold
+above about 0.99, for any configuration, drafter or not. Ours included. The right test
+constrains both runs to the same prefix and asks whether the emitted tokens match what the
+target would have chosen, which is what we eventually ran.
+
+The fixed version is in the model card. It certifies the accept path at block 5 against a
+measured nondeterminism floor.
 
 ## Mistake three: our acceptance metric was the wrong quantity
 
@@ -140,7 +176,7 @@ times further off at block seven, and it gets worse as the block gets longer.
 
 | block | served | corrected offline |
 |---|---|---|
-| 4 | 2.74 | 3.43 |
+| 4 | 2.76 | 3.43 |
 | 5 | 2.88 | 3.79 |
 | 7 | 2.99 | 4.34 |
 
@@ -248,11 +284,23 @@ actually serve. We didn't, and we didn't check.
 
 ## What we are not claiming
 
-Every number above is eager mode, one boot per arm, batch size one, greedy, non-thinking,
-256 token outputs, 8k context. Graph mode is what anyone would actually deploy and we have not
-measured it. Concurrency and soak were never run. Losslessness is not certified. The model
-card lists all of this in more detail than this post does, and it is the document to read
-before using any of it.
+Every number above is eager mode, two boots per arm, batch size one, greedy, non-thinking,
+256 token outputs, 8k context, and the intervals carry no boot to boot variance component.
+
+Graph mode is what anyone would actually deploy. We now know the memory fits under our 0.75
+policy, because we booted the built in MTP baseline in graph mode twice and served four full
+runs on it, and we know graphs make that baseline 3.97% slower rather than faster. What we
+cannot report is graph mode for the drafter, because our own serving plugin asserts
+`enforce_eager` at `serving/plugin/dflash_epoch7.py:80` and refuses to load without it. That
+is our guard, not a vLLM limit and not a memory failure, so the graph comparison is one sided
+and the fix is ours to make.
+
+Concurrency and soak were never run. Neither was thinking mode or sampling, which is what
+someone chasing a maths accelerator on this hardware would actually run.
+
+Losslessness is certified for the accept path at block 5, greedy, against a measured
+nondeterminism floor, and not more than that. The model card lists all of this in more detail
+than this post does, and it is the document to read before using any of it.
 
 ## Links
 
