@@ -1,0 +1,29 @@
+{
+  "runtime_commit": "e962733e08d10f7ca65dac4df99e116460b8b174",
+  "files": {
+    "vllm/model_executor/models/config.py": {
+      "base_sha256": "d941176987c40d14e4128f714ee3e3fee400d20b50bab03b94b051c3de46c791",
+      "overlay_sha256": "18886140bed4739b89f9ff2b4aadde733e70fac9bb1ef12673e444a56e804fe2"
+    },
+    "vllm/models/qwen4_exp/nvidia/model.py": {
+      "base_sha256": "9cf6b2bc7c822c3f08900d0bb02c200ea4436bdfd63e21338b17ae73bacd2376",
+      "overlay_sha256": "4bc43fc83f0cc4af04bb04bbbff20ba166ebd30320e618e3369b1d0cdb9ea2d5"
+    },
+    "vllm/v1/spec_decode/dflash.py": {
+      "base_sha256": "38c10f7b922905562f1af9b64eb98be71c398a7c79e94b40124f4496cab905af",
+      "overlay_sha256": "1851d7ebcbced9dda434c13347f457a9ecc31f65a5f006bb22a17f3986dc7d06"
+    },
+    "vllm/v1/spec_decode/utils.py": {
+      "base_sha256": "edbd1a85a9c372ac3b565453bbe6e37e8b49810b76976f4994dab8970b904af3",
+      "overlay_sha256": "d69c9af8d8bee8d90b895decc02a36a3ed0a86e4009dd27b18a6e8636a384d88"
+    },
+    "vllm/v1/spec_decode/llm_base_proposer.py": {
+      "base_sha256": "86fdf5cc84b35ff568ba8d0ab067ce827c1b32f3c5f5e49b9bcdd8f89accfb81",
+      "overlay_sha256": "ed42a8a01c92d2a4df5a754827c938b6e36c7e0868c61505324c2e713e91fa19"
+    },
+    "vllm/config/speculative.py": {
+      "base_sha256": "ec62c90f60b4467844a35189c0277ff128df6c080ff42c8c4660881c2f444a7f",
+      "overlay_sha256": "6b05e3731873088cef4bc42920e230c44c7bec081f37b85e7cf4a5bf709f58d4"
+    }
+  }
+}

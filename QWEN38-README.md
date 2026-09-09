@@ -5,11 +5,12 @@ feature exporter, the DFlash/DSpark configs, the `qwen4_exp` draft-config
 package, and the trainer/parser patches needed to train against this target.
 
 Full narrative (every decision, correction, dead end, and measured number)
-lives in `docs/dflash-training-log.md` (not included in this repo -- see
+lives in a private engineering log (not included in this repo -- see
 "What's not here" below). This file is the load-bearing summary: enough to
 reproduce or extend the work without re-deriving it.
 
-Tracking issue: `seanphan/pixelml#118`.
+For the serving side, see [`serving/`](serving/). For the write-up, see
+[`blog/`](blog/).
 
 ## Tap definition
 
@@ -171,12 +172,20 @@ diagnostic to within 0.3%).
   comparison) at **0.99695** of positions. The worst per-tap cosine (0.9761)
   came in under the contract's `>= 0.98` PASS bar but above its `< 0.95` STOP
   bar; proceeding past that was a labelled, coordinator-accepted deviation
-  (full reasoning in `docs/dflash-training-log.md`).
+  (full reasoning in the model card).
 - **DFlash training, `block_size=7`, 5 draft layers, 10 epochs, full 99,457-row
-  cache:** pos-1 top-1 agreement and expected-accepted-length `tau` rose every
-  epoch, best at epoch 7 (step 1344): **tau = 3.079452** (epochs 8-10 bought
-  only ~+0.01 tau over epoch 7 and were not worth the extra checkpoint eval
-  cost as the pick).
+  cache:** agreement rose every epoch, best at epoch 7 (step 1344). Training
+  stopped there; epochs 8-10 were worth about +0.01 on the metric in use at the
+  time and were not judged worth the extra evaluation cost.
+
+  **Correction.** The `tau = 3.079452` figure this repo originally reported is
+  **retired**. It was a product of *marginal* per-position agreement rates,
+  which is not the probability of an accepted prefix. `scripts/eval/agreement_curve.py`
+  now reports the joint accepted-prefix quantity; the corrected value for this
+  checkpoint is **E[L] = 4.3371**, and the old proxy is kept alongside it on every
+  output. Neither number predicts served accepted length (measured 2.988 at block 7).
+  See the model card for the full account, and `tests/test_agreement_curve.py`
+  for the 13 tests that pin the fix.
 - A 3-layer / 1-epoch diagnostic at equal training measured pos-1 = 0.0482
   against the 5-layer architecture's pos-1 = 0.3010 at the same training
   budget -- a 6x gap from **depth**, not epochs. Confirms a 3-layer draft is
@@ -188,12 +197,12 @@ diagnostic to within 0.3%).
 
 This repo carries the **source**: the exporter, eval scripts, configs, the
 `qwen4_exp` draft-config package, and the trainer/parser patches. It does
-**not** carry: `docs/dflash-training-log.md` (the full phase-by-phase
-narrative, kept in the private ops clone), the Modal launcher
-(`modal_dflash_p3.py`, same reason), trained checkpoints (pushed separately
-to the private HF repo `PixelML/Qwen3.8-Flash-Next-NVFP4-DFlash`), or the
-regen corpus / target-hidden-state caches (live on the `qwen38-drafter` Modal
-volume, `/vol/dflash_p3/...`).
+**not** carry: the full phase-by-phase engineering narrative, the cloud job
+launcher, or the regen corpus and target-hidden-state caches. The trained
+weights are published separately at
+[`PixelML/Qwen3.8-Flash-Next-NVFP4-DFlash`](https://huggingface.co/PixelML/Qwen3.8-Flash-Next-NVFP4-DFlash);
+the corpus is not published, because it consists of the target model's own
+outputs and carries that model's licence terms.
 
 ## Key files
 

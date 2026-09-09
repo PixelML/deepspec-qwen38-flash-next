@@ -1,3 +1,15 @@
+> **This is a fork.** It carries the Qwen3.8-Flash-Next (`qwen4_exp`) port of
+> DeepSpec: a vLLM feature exporter, the DFlash/DSpark configs and draft-config
+> package, trainer patches, and a corrected acceptance evaluator.
+>
+> - [`QWEN38-README.md`](QWEN38-README.md) — the load-bearing technical summary
+> - [`serving/`](serving/) — the vLLM patches and adapter overlay you need to
+>   serve the drafter at all
+> - [`blog/`](blog/) — the write-up, including the measurement mistakes
+> - Weights: [`PixelML/Qwen3.8-Flash-Next-NVFP4-DFlash`](https://huggingface.co/PixelML/Qwen3.8-Flash-Next-NVFP4-DFlash)
+>
+> Upstream: [deepseek-ai/DeepSpec](https://github.com/deepseek-ai/DeepSpec) (MIT).
+
 # DeepSpec
 
 DeepSpec is a full-stack codebase for training and evaluating draft models for speculative decoding. It contains data preparation utilities, draft model implementations, training code, and evaluation scripts.

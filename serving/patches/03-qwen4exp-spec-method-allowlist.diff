@@ -1,0 +1,17 @@
+--- a/vllm/model_executor/models/config.py
++++ b/vllm/model_executor/models/config.py
+@@ -888,12 +888,14 @@
+         spec_config = vllm_config.speculative_config
+         if spec_config is not None and spec_config.method not in {
+             "mtp",
++            "dflash",  # Paired model overlay supplies contracted HC auxiliaries.
++            "dspark",  # Same DFlash backbone plus Markov/confidence heads.
+             "ngram",
+             "ngram_gpu",
+         }:
+             raise NotImplementedError(
+-                "Qwen4Exp speculative decoding supports only its native MTP "
+-                "checkpoint and linear n-gram proposers"
++                "Qwen4Exp speculative decoding supports native MTP, "
++                "DFlash with contracted HC auxiliaries, and linear n-gram proposers"
+             )

@@ -1,0 +1,183 @@
+--- a/vllm/models/qwen4_exp/nvidia/model.py
++++ b/vllm/models/qwen4_exp/nvidia/model.py
+@@ -313,6 +313,11 @@
+         else:
+             hidden_states, block_input, injection = attn_hc.mix(hidden_states)
+ 
++        if getattr(self, "_dflash_capture_context", False):
++            # Exact exporter boundary: next layer attn HC contraction, not
++            # the raw HC residual or the tapped layer's MLP input.
++            self._dflash_context_feature = block_input
++
+         if self.layer_type == "linear_attention":
+             attn_out = self.linear_attn(hidden_states=block_input)
+         elif self.layer_type == "full_attention":
+@@ -469,6 +474,16 @@
+             )
+         else:
+             self._mtp_hidden_buffer = None
++
++    def set_dflash_aux_hidden_state_layers(self, layers: tuple[int, ...]) -> None:
++        # vLLM auxiliary IDs are boundaries (trained target_layer_ids + 1).
++        if tuple(layers) != (4, 16, 24, 36, 44):
++            raise ValueError("Epoch7 HC boundaries must be (4,16,24,36,44)")
++        if self.start_layer != 0 or self.end_layer != 48:
++            raise ValueError("Epoch7 HC capture requires PP1 and all 48 layers")
++        self._dflash_aux_boundaries = tuple(layers)
++        for index, layer in enumerate(self.layers):
++            layer._dflash_capture_context = index in layers
+ 
+     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
+         return self.embed_tokens(input_ids)
+@@ -496,6 +511,8 @@
+                 raise ValueError("pipeline stage requires intermediate tensors")
+             hidden_states = intermediate_tensors["hidden_states"]
+ 
++        aux_hidden_states = []
++        aux_boundaries = getattr(self, "_dflash_aux_boundaries", ())
+         block_output = None
+         injection = None
+         last_layer = None
+@@ -512,6 +529,8 @@
+                 query_start_loc=query_start_loc,
+                 ngram_context=ngram_context,
+             )
++            if layer_idx in aux_boundaries:
++                aux_hidden_states.append(layer._dflash_context_feature)
+             if deepstack_input_embeds is not None and layer_idx < len(
+                 deepstack_input_embeds
+             ):
+@@ -558,6 +577,10 @@
+             # this tensor is needed by the final mixer regardless).
+             num_tokens = multi_hidden.shape[0]
+             self._mtp_hidden_buffer[:num_tokens].copy_(multi_hidden)
++        if aux_boundaries:
++            if len(aux_hidden_states) != 5:
++                raise RuntimeError("Missing epoch7 HC features in target forward")
++            return sample_hidden_states, aux_hidden_states
+         return sample_hidden_states
+ 
+     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+@@ -850,6 +873,16 @@
+ ):
+     """Qwen3-VL vision tower backed by the Qwen4Exp language model."""
+ 
++    supports_eagle3 = True
++    has_own_embed_tokens = False
++    has_own_lm_head = False
++
++    def set_aux_hidden_state_layers(self, layers: tuple[int, ...]) -> None:
++        self.language_model.model.set_dflash_aux_hidden_state_layers(layers)
++
++    def get_eagle3_default_aux_hidden_state_layers(self) -> tuple[int, ...]:
++        return (4, 16, 24, 36, 44)
++
+     requires_raw_input_tokens = True
+ 
+     packed_modules_mapping = Qwen3_5ForConditionalGeneration.packed_modules_mapping | {
+--- a/vllm/v1/spec_decode/dflash.py
++++ b/vllm/v1/spec_decode/dflash.py
+@@ -37,7 +37,15 @@
+         )
+ 
+         # Only next_token_ids and mask tokens are query tokens, all other context is K/V
+-        self.max_query_tokens = self.max_batch_size * (1 + self.num_speculative_tokens)
++        # DeepSpec supervises query zero to predict anchor+1. Legacy DFlash
++        # instead discards query zero and samples the K mask positions.
++        self.query_zero_predicts_next = self.dflash_config.get(
++            "query_zero_predicts_next", False
++        )
++        self.num_query_per_req = self.num_speculative_tokens + (
++            0 if self.query_zero_predicts_next else 1
++        )
++        self.max_query_tokens = self.max_batch_size * self.num_query_per_req
+         self.max_padded_query_tokens = max(
+             self.max_query_tokens,
+             vllm_config.compilation_config.max_cudagraph_capture_size or 0,
+@@ -116,7 +124,7 @@
+         # Q from query embeddings (bonus + mask tokens).
+         batch_size = cad.batch_size()
+         num_context = target_token_ids.shape[0]
+-        num_query_per_req = 1 + self.num_speculative_tokens
++        num_query_per_req = self.num_query_per_req
+         num_query_total = batch_size * num_query_per_req
+ 
+         # Store for build_model_inputs_first_pass to use
+@@ -168,6 +176,7 @@
+             total_input_tokens=num_context,
+             BLOCK_SIZE=BLOCK_SIZE,
+             HAS_NUM_REJECTED=has_num_rejected,
++            QUERY_ZERO_PREDICTS_NEXT=self.query_zero_predicts_next,
+         )
+ 
+         query_slot_mapping = self._slot_mapping_buffer[:num_query_total]
+--- a/vllm/v1/spec_decode/utils.py
++++ b/vllm/v1/spec_decode/utils.py
+@@ -480,6 +480,7 @@
+     total_input_tokens,  # tl.int32
+     BLOCK_SIZE: tl.constexpr,
+     HAS_NUM_REJECTED: tl.constexpr = False,
++    QUERY_ZERO_PREDICTS_NEXT: tl.constexpr = False,
+ ):
+     """
+     Fused kernel for DFlash first-pass input setup.
+@@ -552,9 +553,12 @@
+     input_id = tl.where(is_bonus, bonus_token, parallel_drafting_token_id)
+     tl.store(out_input_ids_ptr + query_out, input_id, mask=is_query)
+ 
+-    # --- Token indices to sample (mask tokens, skip the bonus token) ---
+-    is_sample = is_query & (query_off > 0)
+-    sample_out_idx = req_idx * num_speculative_tokens + (query_off - 1)
++    # DeepSpec: query zero predicts the token after the known bonus anchor.
++    # Its queries have positions anchor+[0,K), labels anchor+[1,K+1).
++    # Legacy DFlash: skip bonus query, sample masks only.
++    sample_offset = 0 if QUERY_ZERO_PREDICTS_NEXT else 1
++    is_sample = is_query & (query_off >= sample_offset)
++    sample_out_idx = req_idx * num_speculative_tokens + query_off - sample_offset
+     tl.store(
+         out_token_indices_ptr + sample_out_idx,
+         query_out,
+--- a/vllm/v1/spec_decode/llm_base_proposer.py
++++ b/vllm/v1/spec_decode/llm_base_proposer.py
+@@ -1385,6 +1385,7 @@
+                 "MiMoV2OmniForCausalLM",
+                 "Qwen2_5_VLForConditionalGeneration",
+                 "Qwen3_5ForConditionalGeneration",
++                "Qwen4ExpForConditionalGeneration",
+                 "Qwen3_5MoeForConditionalGeneration",
+                 "Qwen3VLForConditionalGeneration",
+                 "Qwen3VLMoeForConditionalGeneration",
+--- a/vllm/config/speculative.py
++++ b/vllm/config/speculative.py
+@@ -1818,7 +1818,12 @@
+         num_draft_tokens = self.num_speculative_tokens
+ 
+         if self.use_dflash():
+-            # DFlash uses one bonus query followed by K mask queries.
++            draft_config = self.draft_model_config.hf_config
++            dflash_config = getattr(draft_config, "dflash_config", None) or {}
++            if dflash_config.get("query_zero_predicts_next", False):
++                # DeepSpec has K total queries, including its bonus anchor.
++                return num_draft_tokens - 1
++            # Legacy DFlash uses one bonus query followed by K mask queries.
+             return num_draft_tokens
+ 
+         if self.parallel_drafting:
+--- a/vllm/model_executor/models/config.py
++++ b/vllm/model_executor/models/config.py
+@@ -888,12 +888,13 @@
+         spec_config = vllm_config.speculative_config
+         if spec_config is not None and spec_config.method not in {
+             "mtp",
++            "dflash",  # Paired model overlay supplies contracted HC auxiliaries.
+             "ngram",
+             "ngram_gpu",
+         }:
+             raise NotImplementedError(
+-                "Qwen4Exp speculative decoding supports only its native MTP "
+-                "checkpoint and linear n-gram proposers"
++                "Qwen4Exp speculative decoding supports native MTP, "
++                "DFlash with contracted HC auxiliaries, and linear n-gram proposers"
+             )
+ 
+ 
