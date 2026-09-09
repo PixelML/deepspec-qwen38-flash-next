@@ -216,6 +216,7 @@ all of this at length.
 ## Upstream
 
 - SGLang: [sgl-project/sglang#38589](https://github.com/sgl-project/sglang/issues/38589)
-- vLLM: see `UPSTREAM.md`
+- vLLM: [vllm-project/vllm#56088](https://github.com/vllm-project/vllm/issues/56088)
+- Detail: [`UPSTREAM.md`](UPSTREAM.md)
 
 We would much rather these landed upstream than lived here.

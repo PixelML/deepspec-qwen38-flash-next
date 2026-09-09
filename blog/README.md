@@ -259,7 +259,7 @@ before using any of it.
 - Weights: [PixelML/Qwen3.8-Flash-Next-NVFP4-DFlash](https://huggingface.co/PixelML/Qwen3.8-Flash-Next-NVFP4-DFlash)
 - Patches, adapter overlay, exporter, and the corrected evaluator with its tests: [PixelML/deepspec-qwen38-flash-next](https://github.com/PixelML/deepspec-qwen38-flash-next)
 - SGLang upstream issue: [sgl-project/sglang#38589](https://github.com/sgl-project/sglang/issues/38589)
-- vLLM upstream issue: linked from the serving README
+- vLLM upstream issue: [vllm-project/vllm#56088](https://github.com/vllm-project/vllm/issues/56088)
 
 The training corpus is not published, because it consists of the target model's own outputs
 and carries that model's licence terms.
