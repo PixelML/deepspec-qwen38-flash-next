@@ -57,6 +57,20 @@ With block 5, aggregate throughput versus native MTP k=4 was:
 
 So it's a math win, a code wash, and a chat regression. Against the softer k=3 baseline the same arm reads math +32.8%, code +3.3% with a CI spanning zero, chat -9.0%.
 
+### The numbers we posted first, and why they're bigger
+
+Those aren't the figures in our first public post about this drafter. That post gave per-workload *medians* against native MTP *k=3*, from the single-boot run that came before we tuned the baseline and reran everything:
+
+| Workload | Native MTP k=3, median tok/s | DFlash block 5, median tok/s | Change |
+|---|---:|---:|---:|
+| Math | 57.58 | 78.36 | +36.1% |
+| Code | 52.50 | 58.79 | +12.0% |
+| Chat | 43.73 | 37.83 | -13.5% |
+
+We posted those as 78.3, 58.7 and 37.8 tokens/sec, which is the same numbers truncated to one decimal. They all reproduce from the per-request records, so we're leaving them up and printing them here rather than quietly replacing them.
+
+Both sets are real measurements of different things. The table before this one is aggregate throughput, meaning total output tokens over total wall time, against the tuned k=4 baseline, over two boots per arm. This one is the median of per-request throughput against the untuned k=3 baseline on one boot. Medians drop the slow tail that aggregate throughput has to pay for, and k=3 is the easier baseline, so the same runs read higher here. Math and chat shift a bit between the two framings. Code is the one that moves materially: +12.0% by medians against k=3, and +0.4% with a confidence interval spanning zero against the tuned k=4 baseline. On the better-controlled comparison we can't tell the code gain apart from zero.
+
 Our training mix was about 78% math and code. We then evaluated on a roughly balanced fixture. That is a plausible explanation for the split, but we haven't run the ablation to establish it.
 
 We also trained at block size 7, which produced the highest accepted length. Block 5 still won on wall-clock throughput. These configurations need separate measurement: draft queries attend to each other bidirectionally, so a smaller block is not simply a truncated larger one.
